@@ -12,7 +12,7 @@ from sklearn.preprocessing import PolynomialFeatures
 
 
 st.set_page_config(
-    page_title="Stock Price Prediction App",
+    page_title="TSLA Stock Price Prediction App",
     page_icon="📈",
     layout="wide",
 )
@@ -30,13 +30,6 @@ CUSTOM_CSS = """
         font-size: 1.05rem;
         margin-bottom: 1.5rem;
     }
-    .metric-card {
-        background: linear-gradient(135deg, #111827, #1f2937);
-        border-radius: 16px;
-        padding: 18px;
-        color: white;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-    }
     .small-note {
         color: #6b7280;
         font-size: 0.9rem;
@@ -46,18 +39,48 @@ CUSTOM_CSS = """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=60 * 60)
-def load_stock_data(ticker: str, start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
-    """Download historical market data from Yahoo Finance."""
-    # yfinance end date is exclusive, so add one day to include the chosen end date.
-    download_end = end_date + dt.timedelta(days=1)
-    data = yf.download(
-        ticker,
-        start=start_date,
-        end=download_end,
-        progress=False,
-        auto_adjust=False,
-    )
+HORIZON_OPTIONS = {
+    "Next minute": {"steps": 1, "interval": "1m", "unit": "minute"},
+    "Next day": {"steps": 1, "interval": "1d", "unit": "business day"},
+    "Next week": {"steps": 5, "interval": "1d", "unit": "business days"},
+    "Next month": {"steps": 21, "interval": "1d", "unit": "business days"},
+    "Next year": {"steps": 252, "interval": "1d", "unit": "business days"},
+    "Custom": {"steps": 30, "interval": "1d", "unit": "business days"},
+}
+
+
+@st.cache_data(ttl=60 * 30)
+def load_stock_data(
+    ticker: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    interval: str,
+) -> pd.DataFrame:
+    """Download market data from Yahoo Finance.
+
+    Daily data uses the selected date range.
+    1-minute data uses Yahoo Finance's recent intraday data window.
+    """
+    if interval == "1m":
+        data = yf.download(
+            ticker,
+            period="7d",
+            interval="1m",
+            progress=False,
+            auto_adjust=False,
+            prepost=False,
+        )
+    else:
+        # yfinance end date is exclusive, so add one day to include the chosen end date.
+        download_end = end_date + dt.timedelta(days=1)
+        data = yf.download(
+            ticker,
+            start=start_date,
+            end=download_end,
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
@@ -87,22 +110,33 @@ def add_indicators(data: pd.DataFrame, price_col: str) -> pd.DataFrame:
     df["MA20"] = df[price_col].rolling(window=20).mean()
     df["MA50"] = df[price_col].rolling(window=50).mean()
     df["MA200"] = df[price_col].rolling(window=200).mean()
-    df["Daily Return"] = df[price_col].pct_change()
+    df["Return"] = df[price_col].pct_change()
     return df
 
 
-def make_forecast(data: pd.DataFrame, price_col: str, forecast_days: int, model_type: str, degree: int):
-    """Train a simple time-index regression model and predict future prices."""
+def make_forecast(
+    data: pd.DataFrame,
+    price_col: str,
+    forecast_steps: int,
+    model_type: str,
+    degree: int,
+    interval: str,
+):
+    """Train a simple time-index regression model and predict future prices.
+
+    This app does not use a saved pre-trained model. It trains a small regression
+    model live from the currently downloaded data.
+    """
     df = data[[price_col]].dropna().copy()
     df = df.reset_index()
     df = df.rename(columns={df.columns[0]: "Date"})
-    df["Day"] = np.arange(len(df))
+    df["Step"] = np.arange(len(df))
 
-    X = df[["Day"]]
+    X = df[["Step"]]
     y = df[price_col]
 
     if len(df) < 30:
-        raise ValueError("Not enough data for prediction. Please choose a longer date range.")
+        raise ValueError("Not enough data for prediction. Please choose a longer date range or a different ticker.")
 
     split_index = max(int(len(df) * 0.8), 1)
     X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
@@ -118,11 +152,14 @@ def make_forecast(data: pd.DataFrame, price_col: str, forecast_days: int, model_
 
     # Refit on the full data before forecasting the future.
     model.fit(X, y)
-    future_days = pd.DataFrame({"Day": np.arange(len(df), len(df) + forecast_days)})
-    future_predictions = model.predict(future_days)
+    future_steps = pd.DataFrame({"Step": np.arange(len(df), len(df) + forecast_steps)})
+    future_predictions = model.predict(future_steps)
 
     last_date = pd.to_datetime(data.index[-1])
-    future_dates = pd.bdate_range(last_date + pd.offsets.BDay(1), periods=forecast_days)
+    if interval == "1m":
+        future_dates = pd.date_range(last_date + pd.Timedelta(minutes=1), periods=forecast_steps, freq="min")
+    else:
+        future_dates = pd.bdate_range(last_date + pd.offsets.BDay(1), periods=forecast_steps)
 
     forecast_df = pd.DataFrame(
         {
@@ -157,7 +194,7 @@ def format_money(value):
 # Header
 st.markdown('<div class="main-title">📈 Stock Price Prediction App</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Analyze historical stock data and generate simple future price forecasts.</div>',
+    '<div class="subtitle">Analyze TSLA or any ticker and forecast the next minute, day, week, month, or year.</div>',
     unsafe_allow_html=True,
 )
 
@@ -165,15 +202,39 @@ st.markdown(
 # Sidebar controls
 st.sidebar.header("⚙️ App Settings")
 
-ticker = st.sidebar.text_input("Stock ticker", value="AAPL", help="Examples: AAPL, MSFT, TSLA, AMZN, NVDA").upper().strip()
+ticker = st.sidebar.text_input(
+    "Stock ticker",
+    value="TSLA",
+    help="Examples: TSLA, AAPL, MSFT, AMZN, NVDA",
+).upper().strip()
+
+prediction_target = st.sidebar.selectbox(
+    "Prediction target",
+    list(HORIZON_OPTIONS.keys()),
+    index=1,
+)
+
+selected_horizon = HORIZON_OPTIONS[prediction_target]
+interval = selected_horizon["interval"]
+forecast_steps = selected_horizon["steps"]
+
+if prediction_target == "Custom":
+    forecast_steps = st.sidebar.slider("Custom forecast business days", min_value=1, max_value=252, value=30, step=1)
+
+if prediction_target == "Next minute":
+    st.sidebar.info("Next-minute prediction uses recent 1-minute intraday data from Yahoo Finance, usually limited to the last 7 days.")
+
 
 today = dt.date.today()
 default_start = today - dt.timedelta(days=365 * 5)
 
-start_date = st.sidebar.date_input("Start date", value=default_start, max_value=today)
-end_date = st.sidebar.date_input("End date", value=today, max_value=today)
+if interval == "1d":
+    start_date = st.sidebar.date_input("Start date", value=default_start, max_value=today)
+    end_date = st.sidebar.date_input("End date", value=today, max_value=today)
+else:
+    start_date = today - dt.timedelta(days=7)
+    end_date = today
 
-forecast_days = st.sidebar.slider("Forecast business days", min_value=7, max_value=120, value=30, step=1)
 model_type = st.sidebar.selectbox("Prediction model", ["Linear Regression", "Polynomial Regression"])
 degree = 2
 if model_type == "Polynomial Regression":
@@ -183,23 +244,22 @@ show_volume = st.sidebar.checkbox("Show volume chart", value=True)
 show_company_info = st.sidebar.checkbox("Show company info", value=True)
 
 st.sidebar.markdown("---")
-st.sidebar.info(
-    "This app is for educational purposes only. Predictions are not financial advice."
-)
+st.sidebar.caption("No separate trained model file is required. The app trains a small regression model live from the selected data.")
+st.sidebar.info("This app is for educational purposes only. Predictions are not financial advice.")
 
 
 if not ticker:
     st.warning("Please enter a stock ticker in the sidebar.")
     st.stop()
 
-if start_date >= end_date:
+if interval == "1d" and start_date >= end_date:
     st.error("Start date must be earlier than end date.")
     st.stop()
 
 
 try:
     with st.spinner(f"Loading data for {ticker}..."):
-        data = load_stock_data(ticker, start_date, end_date)
+        data = load_stock_data(ticker, start_date, end_date, interval)
 
     if data.empty:
         st.error("No data found. Please check the ticker symbol or choose a different date range.")
@@ -221,6 +281,12 @@ try:
     col2.metric("Period Change", format_money(price_change), f"{price_change_pct:,.2f}%")
     col3.metric("Highest Price", format_money(high_price))
     col4.metric("Lowest Price", format_money(low_price))
+
+    data_frequency_label = "1-minute intraday" if interval == "1m" else "daily"
+    st.caption(
+        f"Using {data_frequency_label} data. Target: {prediction_target}. "
+        f"Forecast steps: {forecast_steps} {selected_horizon['unit']}"
+    )
 
     if show_company_info:
         info = load_company_info(ticker)
@@ -259,7 +325,7 @@ try:
                 x=data.index,
                 y=data["MA20"],
                 mode="lines",
-                name="20-Day MA",
+                name="20-period MA",
                 line=dict(color="#f97316", width=1.5),
             )
         )
@@ -268,7 +334,7 @@ try:
                 x=data.index,
                 y=data["MA50"],
                 mode="lines",
-                name="50-Day MA",
+                name="50-period MA",
                 line=dict(color="#16a34a", width=1.5),
             )
         )
@@ -277,7 +343,7 @@ try:
                 x=data.index,
                 y=data["MA200"],
                 mode="lines",
-                name="200-Day MA",
+                name="200-period MA",
                 line=dict(color="#9333ea", width=1.5),
             )
         )
@@ -285,7 +351,7 @@ try:
             template="plotly_white",
             height=560,
             hovermode="x unified",
-            xaxis_title="Date",
+            xaxis_title="Date/Time",
             yaxis_title="Price",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
@@ -294,32 +360,36 @@ try:
         if show_volume and "Volume" in data.columns:
             st.subheader("Trading Volume")
             volume_fig = go.Figure()
-            volume_fig.add_trace(
-                go.Bar(x=data.index, y=data["Volume"], name="Volume", marker_color="#64748b")
-            )
+            volume_fig.add_trace(go.Bar(x=data.index, y=data["Volume"], name="Volume", marker_color="#64748b"))
             volume_fig.update_layout(
                 template="plotly_white",
                 height=300,
-                xaxis_title="Date",
+                xaxis_title="Date/Time",
                 yaxis_title="Volume",
             )
             st.plotly_chart(volume_fig, use_container_width=True)
 
     with tabs[1]:
-        st.subheader(f"{ticker} Price Forecast")
+        st.subheader(f"{ticker} Forecast: {prediction_target}")
         try:
             forecast_df, metrics, backtest_df = make_forecast(
                 data=data,
                 price_col=price_col,
-                forecast_days=forecast_days,
+                forecast_steps=forecast_steps,
                 model_type=model_type,
                 degree=degree,
+                interval=interval,
             )
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Backtest MAE", format_money(metrics["MAE"]))
-            m2.metric("Backtest RMSE", format_money(metrics["RMSE"]))
-            m3.metric("Backtest R²", "N/A" if pd.isna(metrics["R2"]) else f"{metrics['R2']:,.3f}")
+            predicted_final_price = forecast_df["Predicted Price"].iloc[-1]
+            forecast_change = predicted_final_price - latest_price
+            forecast_change_pct = (forecast_change / latest_price) * 100
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Forecasted Price", format_money(predicted_final_price), f"{forecast_change_pct:,.2f}%")
+            m2.metric("Backtest MAE", format_money(metrics["MAE"]))
+            m3.metric("Backtest RMSE", format_money(metrics["RMSE"]))
+            m4.metric("Backtest R²", "N/A" if pd.isna(metrics["R2"]) else f"{metrics['R2']:,.3f}")
 
             forecast_fig = go.Figure()
             forecast_fig.add_trace(
@@ -345,7 +415,7 @@ try:
                 template="plotly_white",
                 height=560,
                 hovermode="x unified",
-                xaxis_title="Date",
+                xaxis_title="Date/Time",
                 yaxis_title="Price",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
@@ -405,17 +475,21 @@ try:
         st.write(
             """
             This Streamlit app downloads stock market data using Yahoo Finance, displays historical prices,
-            calculates common moving averages, and creates a simple price forecast using regression.
+            calculates moving averages, and creates a simple forecast using regression.
+
+            **Important model note:** This version does **not** need a separate trained model file like `gru_model.h5`.
+            It trains a lightweight regression model live whenever the user selects a ticker and prediction target.
 
             **Features:**
-            - Ticker search
+            - Default ticker is TSLA, but any Yahoo Finance ticker can be entered
+            - Forecast targets: next minute, next day, next week, next month, next year, or custom business days
             - Historical price and volume charts
-            - Moving averages: 20-day, 50-day, and 200-day
+            - Moving averages: 20-period, 50-period, and 200-period
             - Linear or polynomial regression forecast
             - Backtest metrics: MAE, RMSE, and R²
             - CSV downloads
 
-            **Important:** This is an educational project. Stock markets are unpredictable, and this model is intentionally simple.
+            **Disclaimer:** This is an educational project. Stock markets are unpredictable, and this model is intentionally simple.
             Do not use the output as financial advice.
             """
         )
